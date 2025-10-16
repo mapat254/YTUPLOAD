@@ -3,17 +3,19 @@ import os
 import json
 import tempfile
 import time
+import urllib.parse
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
-from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-import urllib.parse
 
 st.set_page_config(page_title="YouTube Video Uploader", page_icon="🎥")
 
 # Konfigurasi OAuth
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload', 
                   'https://www.googleapis.com/auth/youtube']
+
+# Redirect URI untuk aplikasi Streamlit
+REDIRECT_URI = "https://ytupload.streamlit.app/"
 
 def main():
     st.title("🎥 YouTube Video Uploader")
@@ -26,6 +28,8 @@ def main():
         st.session_state.channels = []
     if 'selected_channel' not in st.session_state:
         st.session_state.selected_channel = None
+    if 'auth_state' not in st.session_state:
+        st.session_state.auth_state = None
     
     # Tab navigation
     tab1, tab2, tab3 = st.tabs(["🔑 Autentikasi", "📺 Pilih Channel", "📤 Upload Video"])
@@ -42,11 +46,12 @@ def main():
 def authentication_tab():
     st.header("🔑 Autentikasi YouTube")
     
-    st.info("""
+    st.info(f"""
     **Langkah Autentikasi:**
-    1. Unggah file `client_secret.json` dari Google Cloud Console
-    2. Klik tombol "🔐 Autentikasi dengan YouTube"
-    3. Ikuti proses login dan izinkan akses
+    1. Pastikan `client_secret.json` sudah terdaftar dengan redirect URI: `{REDIRECT_URI}`
+    2. Unggah file `client_secret.json` dari Google Cloud Console
+    3. Klik tombol "🔐 Autentikasi dengan YouTube"
+    4. Ikuti proses login dan izinkan akses
     """)
     
     # Upload client_secret.json
@@ -64,56 +69,104 @@ def authentication_tab():
         if st.button("🔐 Autentikasi dengan YouTube", type="primary"):
             start_oauth_flow()
     
+    # Handle OAuth callback
+    handle_oauth_callback()
+    
     # Tampilkan status autentikasi
     if st.session_state.credentials:
         st.success("✅ Anda sudah terautentikasi!")
-        creds_info = json.loads(st.session_state.credentials.to_json())
-        st.json(creds_info)
     else:
         st.warning("⚠️ Anda belum terautentikasi")
 
 def start_oauth_flow():
-    """Mulai proses OAuth flow"""
+    """Mulai proses OAuth flow dengan redirect URI yang benar"""
     try:
-        # Buat redirect URL
-        redirect_uri = "http://localhost:8501/oauth_callback"  # Untuk lokal
-        
         # Baca client secret
         with open(st.session_state.client_secret_path, 'r') as f:
             client_config = json.load(f)
+        
+        # Modifikasi redirect URI dalam client config
+        if 'web' in client_config:
+            client_config['web']['redirect_uris'] = [REDIRECT_URI]
+        elif 'installed' in client_config:
+            # Untuk installed apps, kita tetap bisa menggunakan redirect
+            pass
         
         # Buat OAuth flow
         flow = Flow.from_client_config(
             client_config,
             scopes=YOUTUBE_SCOPES,
-            redirect_uri=redirect_uri
+            redirect_uri=REDIRECT_URI
         )
         
         # Simpan flow di session state
         st.session_state.oauth_flow = flow
         
         # Dapatkan authorization URL
-        auth_url, _ = flow.authorization_url(prompt='consent')
+        auth_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'
+        )
+        
+        # Simpan state untuk verifikasi
+        st.session_state.auth_state = state
         
         st.markdown(f"**Klik link berikut untuk autentikasi:**")
         st.markdown(f"[🔐 Login ke YouTube]({auth_url})")
-        st.info("Setelah login, Anda akan mendapatkan kode autentikasi. Salin kode tersebut dan masukkan di bawah.")
+        st.info(f"""
+        **Instruksi:**
+        1. Klik link di atas untuk login
+        2. Setelah login dan memberi izin, Anda akan dialihkan ke URL dengan kode
+        3. Salin URL lengkap setelah redirect dan masukkan di bawah
+        """)
         
-        # Input untuk kode autentikasi
-        auth_code = st.text_input("Masukkan kode autentikasi:")
+        # Input untuk URL setelah redirect
+        redirect_url = st.text_input("Masukkan URL lengkap setelah redirect:")
         
-        if auth_code:
-            try:
-                # Tukar kode dengan credentials
-                flow.fetch_token(code=auth_code)
-                st.session_state.credentials = flow.credentials
-                st.success("✅ Autentikasi berhasil!")
-                st.experimental_rerun()
-            except Exception as e:
-                st.error(f"❌ Error saat menukar kode: {str(e)}")
-                
+        if redirect_url:
+            st.session_state.redirect_url = redirect_url
+            st.experimental_rerun()
+            
     except Exception as e:
         st.error(f"❌ Error autentikasi: {str(e)}")
+
+def handle_oauth_callback():
+    """Handle OAuth callback dari URL"""
+    try:
+        # Cek jika ada redirect URL yang disimpan
+        if 'redirect_url' in st.session_state and st.session_state.redirect_url:
+            redirect_url = st.session_state.redirect_url
+            
+            # Parse URL untuk mendapatkan kode
+            parsed_url = urllib.parse.urlparse(redirect_url)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            
+            # Dapatkan kode dan state
+            auth_code = query_params.get('code', [None])[0]
+            state = query_params.get('state', [None])[0]
+            
+            if auth_code:
+                # Verifikasi state
+                if state == st.session_state.auth_state:
+                    # Tukar kode dengan credentials
+                    flow = st.session_state.oauth_flow
+                    flow.fetch_token(code=auth_code)
+                    st.session_state.credentials = flow.credentials
+                    
+                    # Hapus URL redirect yang sudah diproses
+                    del st.session_state.redirect_url
+                    del st.session_state.auth_state
+                    
+                    st.success("✅ Autentikasi berhasil!")
+                    st.experimental_rerun()
+                else:
+                    st.error("❌ State tidak sesuai. Kemungkinan ada masalah dengan autentikasi.")
+            else:
+                st.error("❌ Tidak dapat mengekstrak kode autentikasi dari URL")
+                
+    except Exception as e:
+        st.error(f"❌ Error handling callback: {str(e)}")
 
 def channel_selection_tab():
     st.header("📺 Pilih Channel YouTube")
@@ -172,6 +225,10 @@ def channel_selection_tab():
 def get_youtube_channels():
     """Dapatkan daftar channel YouTube"""
     try:
+        if not st.session_state.credentials:
+            st.warning("❌ Tidak ada credentials")
+            return
+            
         youtube = build('youtube', 'v3', credentials=st.session_state.credentials)
         
         # Dapatkan daftar channel
@@ -266,80 +323,35 @@ def upload_video_tab():
         else:
             st.warning("⚠️ Silakan pilih file video terlebih dahulu")
 
-# Versi implementasi nyata untuk upload video
-def upload_video_to_youtube_real(video_path, title, description, category, privacy_status, tags):
-    """Implementasi nyata upload video ke YouTube"""
-    try:
-        # Build YouTube service
-        youtube = build('youtube', 'v3', credentials=st.session_state.credentials)
-        
-        # Buat request upload
-        request = youtube.videos().insert(
-            part="snippet,status",
-            body={
-                "snippet": {
-                    "title": title,
-                    "description": description,
-                    "tags": tags.split(",") if tags else [],
-                    "categoryId": category.split(" - ")[0]
-                },
-                "status": {
-                    "privacyStatus": privacy_status
-                }
-            },
-            media_body=video_path  # Path ke file video
-        )
-        
-        # Eksekusi upload
-        response = request.execute()
-        return response.get('id')
-        
-    except Exception as e:
-        st.error(f"Error upload: {str(e)}")
-        return None
-
-# Versi untuk mengambil video dari Google Drive (implementasi nyata)
-def get_drive_videos(folder_id):
-    """Dapatkan daftar video dari Google Drive folder"""
-    try:
-        # Ini memerlukan autentikasi Google Drive terpisah
-        # Implementasi lengkap akan memerlukan service account atau OAuth untuk Drive
-        
-        # Untuk demo, return daftar simulasi
-        return [
-            {"id": "file1", "name": "video1.mp4", "size": "100MB"},
-            {"id": "file2", "name": "video2.mov", "size": "150MB"},
-            {"id": "file3", "name": "video3.avi", "size": "80MB"}
-        ]
-        
-    except Exception as e:
-        st.error(f"Error mengambil video dari Drive: {str(e)}")
-        return []
-
 # Informasi dan bantuan
 def show_help_info():
     st.sidebar.title("ℹ️ Bantuan")
-    st.sidebar.markdown("""
-    ### Langkah-langkah Penggunaan:
+    st.sidebar.markdown(f"""
+    ### Konfigurasi Google Cloud Console:
     
-    **1. Tab Autentikasi:**
-    - Unggah `client_secret.json`
-    - Klik tombol autentikasi
-    - Login dan beri izin akses
+    **Redirect URI yang digunakan:**
+    ```
+    {REDIRECT_URI}
+    ```
     
-    **2. Tab Pilih Channel:**
-    - Refresh daftar channel
-    - Pilih channel yang diinginkan
+    **Langkah Setup:**
+    1. Buat project di [Google Cloud Console](https://console.cloud.google.com/)
+    2. Aktifkan YouTube Data API v3
+    3. Buat OAuth 2.0 credentials (Web Application)
+    4. Tambahkan redirect URI di atas
+    5. Download `client_secret.json`
     
-    **3. Tab Upload Video:**
-    - Pilih video (simulasi)
-    - Isi detail video
-    - Klik upload
+    **Langkah Autentikasi:**
+    1. Unggah `client_secret.json`
+    2. Klik "🔐 Autentikasi dengan YouTube"
+    3. Klik link untuk login
+    4. Setelah redirect, salin URL lengkap
+    5. Masukkan URL di input yang disediakan
     
-    ### Catatan Penting:
-    - Autentikasi penuh hanya berfungsi di lokal
-    - Streamlit Cloud memiliki keterbatasan OAuth
-    - Untuk produksi, simpan credentials dengan aman
+    ### Troubleshooting:
+    - Pastikan redirect URI sudah terdaftar di Google Cloud Console
+    - Gunakan tipe "Web Application" untuk OAuth credentials
+    - Tunggu beberapa menit setelah menambahkan redirect URI
     """)
 
 if __name__ == "__main__":
